@@ -1,37 +1,51 @@
 #!/usr/bin/env python3
-"""RKCamRecord3 v8 — 稳定录像 + 实时推流 + 文件下载"""
-import cv2, os, sys, time, threading
+"""RKCamRecord3 v9 — 可调分辨率 + 稳定录像"""
+import cv2, os, time, threading
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib
 from flask import Flask, Response, jsonify, send_file, abort
 
-CAMERA = 11; W, H = 1920, 1080; FPS = 24; JPEG_Q = 75; PORT = 5000
+CAMERA = 11
+RESOLUTIONS = {
+    "高清 (1080p)": (1920, 1080),
+    "标清 (720p)": (1280, 720),
+    "流畅 (480p)": (640, 480),
+    "省流 (360p)": (480, 360),
+}
+FPS = 24; JPEG_Q = 75; PORT = 5000
 REC_DIR = "/home/cat/recordings"
 os.makedirs(REC_DIR, exist_ok=True)
 Gst.init(None)
 
+cur_res = "高清 (1080p)"
+W, H = RESOLUTIONS[cur_res]
 frame_lock = threading.Lock()
 current_frame = None; cam_online = False; recording = False; recorder = None
 
 class CameraWorker:
     def __init__(self):
-        self.cap = None; self.running = True; self.thread = None
+        self.cap = None; self.running = True; self.thread = None; self.restart = False
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+    def reopen(self):
+        self.restart = True
     def _run(self):
-        global current_frame, cam_online
+        global current_frame, cam_online, W, H
         while self.running:
             try:
-                if self.cap is None or not self.cap.isOpened():
+                if self.cap is None or not self.cap.isOpened() or self.restart:
+                    if self.cap: self.cap.release()
+                    self.restart = False
+                    os.system(f"v4l2-ctl -d /dev/video11 --set-fmt-video=width={W},height={H},pixelformat=NV12 >/dev/null 2>&1")
                     cap = cv2.VideoCapture(CAMERA)
                     if cap.isOpened():
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
                         cap.set(cv2.CAP_PROP_FPS, FPS)
                         self.cap = cap
-                        print(f"[Camera] /dev/video{CAMERA} — {W}x{H}")
+                        print(f"[Camera] {W}x{H} @ {FPS}FPS")
                     else: time.sleep(1); continue
                 ret, frame = self.cap.read()
                 if ret:
@@ -59,7 +73,7 @@ class HWRecorder:
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
         return True
     def _run(self):
-        global current_frame
+        global current_frame, W, H
         self.filepath = self.path()
         ps = (f"appsrc name=src is-live=true format=time caps=video/x-raw,format=BGR,width={W},height={H},framerate={FPS}/1 "
               "! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! qtmux ! "
@@ -73,7 +87,7 @@ class HWRecorder:
         bus.connect("message::error", on_error); bus.connect("message::eos", on_eos)
         self.pipeline.set_state(Gst.State.PLAYING); time.sleep(0.5)
         self.start_ts = time.time()
-        print(f"[Rec] started → {self.filepath}")
+        print(f"[Rec] {W}x{H} → {self.filepath}")
         while self.active and not self._stop_req:
             with frame_lock: f = current_frame
             if f is None: time.sleep(0.01); continue
@@ -86,15 +100,16 @@ class HWRecorder:
         self.loop.run()
         self.pipeline.set_state(Gst.State.NULL)
         self.active = False
-        elapsed = time.time() - self.start_ts
         sz = os.path.getsize(self.filepath) if os.path.exists(self.filepath) else 0
-        print(f"[Rec] DONE → {self.filepath}  ({sz/1024:.0f}KB, {self.fc}帧, {self.fc/elapsed:.1f}FPS)")
+        el = time.time() - self.start_ts
+        print(f"[Rec] DONE {sz/1024:.0f}KB {self.fc}帧")
     def stop(self):
         if not self.active: return
         self._stop_req = True
         if self.thread: self.thread.join(timeout=10)
 
 app = Flask(__name__)
+cam = CameraWorker()
 
 def gen_stream():
     while True:
@@ -113,13 +128,25 @@ def stream():
 
 @app.route("/status")
 def status():
-    files = sorted(os.listdir(REC_DIR), reverse=True)[:30]
     fl = []
-    for f in files:
+    for f in sorted(os.listdir(REC_DIR), reverse=True)[:30]:
         fp = os.path.join(REC_DIR, f)
-        try: sz = os.path.getsize(fp); mt = os.path.getmtime(fp); fl.append({"name": f, "size": sz, "time": mt})
+        try: sz = os.path.getsize(fp); fl.append({"name": f, "size": sz})
         except: pass
-    return jsonify({"cam_online": cam_online, "recording": recording, "resolution": f"{W}x{H}", "fps": FPS, "files": fl})
+    return jsonify({
+        "cam_online": cam_online, "recording": recording,
+        "resolution": f"{W}x{H}", "res_label": cur_res,
+        "fps": FPS, "files": fl, "resolutions": list(RESOLUTIONS.keys())
+    })
+
+@app.route("/resolution/<label>", methods=["POST"])
+def set_resolution(label):
+    global cur_res, W, H
+    if label not in RESOLUTIONS: return jsonify({"ok": False, "error": "unknown"})
+    cur_res = label
+    W, H = RESOLUTIONS[label]
+    cam.reopen()
+    return jsonify({"ok": True, "resolution": f"{W}x{H}"})
 
 @app.route("/record/start", methods=["POST"])
 def rec_start():
@@ -170,10 +197,11 @@ h1{font-size:20px;background:linear-gradient(135deg,#667eea,#764ba2);-webkit-bac
 .btn-rec{background:#dc2626;color:#fff}.btn-rec:hover{background:#b91c1c}
 .btn-stop{background:#6366f1;color:#fff}.btn-stop:hover{background:#4f46e5}
 .btn:disabled{opacity:.4;cursor:not-allowed}
-.info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
-.info-card{background:#1a1a2e;border-radius:8px;padding:12px;border:1px solid #2a2a3e;text-align:center}
-.info-card .label{font-size:11px;color:#888;text-transform:uppercase}
-.info-card .value{font-size:20px;font-weight:700;margin-top:4px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.card{background:#1a1a2e;border-radius:8px;padding:12px;border:1px solid #2a2a3e;flex:1;min-width:140px;text-align:center}
+.card .label{font-size:11px;color:#888;text-transform:uppercase}
+.card .value{font-size:20px;font-weight:700;margin-top:4px}
+select{background:#2a2a4e;color:#eee;border:1px solid #3a3a5e;border-radius:6px;padding:8px 12px;font-size:14px;cursor:pointer}
 .files-box{background:#1a1a2e;border-radius:8px;border:1px solid #2a2a3e;padding:12px}
 .files-box h3{font-size:14px;color:#888;margin-bottom:8px}
 .file-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #2a2a3e;font-size:13px}
@@ -193,7 +221,7 @@ h1{font-size:20px;background:linear-gradient(135deg,#667eea,#764ba2);-webkit-bac
 <div id="toast" class="toast"><div class="tt">✅ 录像完成</div><div class="ts" id="toastMsg"></div></div>
 <div class="container">
   <header><h1>📷 RKCamRecord3</h1>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <span id="camBadge" class="status-badge offline">🔴 相机离线</span>
       <span id="recBadge" class="status-badge offline">⏹ 未录像</span>
     </div>
@@ -203,11 +231,11 @@ h1{font-size:20px;background:linear-gradient(135deg,#667eea,#764ba2);-webkit-bac
     <button class="btn btn-rec" id="btnStart" onclick="startRec()">🎬 开始录像</button>
     <button class="btn btn-stop" id="btnStop" onclick="stopRec()" disabled>⏹ 停止录像</button>
   </div>
-  <div class="info-grid">
-    <div class="info-card"><div class="label">分辨率</div><div class="value">1920×1080</div></div>
-    <div class="info-card"><div class="label">帧率</div><div class="value">24 FPS</div></div>
-    <div class="info-card"><div class="label">编码</div><div class="value">H.264 HW</div></div>
-    <div class="info-card"><div class="label">录像时长</div><div class="value" id="recTime">00:00</div></div>
+  <div class="row">
+    <div class="card"><div class="label">分辨率</div><div><select id="resSelect" onchange="changeRes()"></select></div></div>
+    <div class="card"><div class="label">帧率</div><div class="value">24 FPS</div></div>
+    <div class="card"><div class="label">编码</div><div class="value">H.264 HW</div></div>
+    <div class="card"><div class="label">录像时长</div><div class="value" id="recTime">00:00</div></div>
   </div>
   <div class="files-box">
     <h3>📁 已录文件 <span style="color:#666;font-weight:400;font-size:12px">（点击下载到电脑）</span></h3>
@@ -215,9 +243,10 @@ h1{font-size:20px;background:linear-gradient(135deg,#667eea,#764ba2);-webkit-bac
   </div>
 </div>
 <script>
-let recStartTime=null,recTimer=null
+let recStartTime=null,recTimer=null,lastLabel=''
 function showToast(msg,dur){document.getElementById('toastMsg').textContent=msg;document.getElementById('toast').classList.add('show');setTimeout(()=>document.getElementById('toast').classList.remove('show'),dur||5000)}
 function fmtSize(b){if(!b)return'0B';const u=['B','KB','MB','GB'];let i=0;while(b>=1024&&i<3){b/=1024;i++}return(i<2?Math.round(b):b.toFixed(1))+u[i]}
+function changeRes(){const sel=document.getElementById('resSelect');const v=sel.value;if(v===lastLabel)return;fetch('/resolution/'+encodeURIComponent(v),{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok){lastLabel=v;showToast('分辨率切换为 '+v,3000);updateStatus()}})}
 function updateStatus(){fetch('/status').then(r=>r.json()).then(d=>{
 document.getElementById('camBadge').className='status-badge '+(d.cam_online?'online':'offline')
 document.getElementById('camBadge').innerHTML=d.cam_online?'🟢 相机在线':'🔴 相机离线'
@@ -228,18 +257,19 @@ document.getElementById('btnStart').disabled=r;document.getElementById('btnStop'
 if(!r&&recTimer){clearInterval(recTimer);recTimer=null}
 if(r&&!recTimer){recStartTime=Date.now();recTimer=setInterval(()=>{const s=Math.floor((Date.now()-recStartTime)/1000);document.getElementById('recTime').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')},1000)}
 if(!r)document.getElementById('recTime').textContent='00:00'
+const sel=document.getElementById('resSelect');lastLabel=d.res_label
+if(sel.options.length===0){d.resolutions.forEach(r=>{const o=document.createElement('option');o.value=r;o.text=r;sel.appendChild(o)});sel.value=d.res_label}
 if(d.files&&d.files.length){document.getElementById('fileList').innerHTML=d.files.map(f=>'<div class="file-item"><span class="fname">'+f.name+'</span><span class="fsize">'+fmtSize(f.size)+'</span><a class="fdl" href="/download/'+f.name+'" download>⬇ 下载</a></div>').join('')}else{document.getElementById('fileList').innerHTML='<div style="color:#666;font-size:13px">暂无录像文件</div>'}
 }).catch(()=>{})}
-function startRec(){fetch('/record/start',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok)updateStatus()})}
+function startRec(){if(document.getElementById('recBadge').textContent.includes('录像中'))return;fetch('/record/start',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok)updateStatus()})}
 function stopRec(){fetch('/record/stop',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok){updateStatus();const msg=d.file+' ('+fmtSize(d.size)+', '+d.frames+'帧)';showToast(msg,6000);setTimeout(updateStatus,500)}})}
-updateStatus();setInterval(updateStatus,3000)
+setTimeout(updateStatus,200);setInterval(updateStatus,3000)
 </script></body></html>"""
 
 if __name__ == "__main__":
     print("="*50)
-    print("  RKCamRecord3 v8 — 稳定录像 + 下载")
+    print("  RKCamRecord3 v9 — 可调分辨率")
     print("="*50)
     cam = CameraWorker(); cam.start(); time.sleep(1)
     print(f"  http://0.0.0.0:{PORT}/")
-    print(f"  📁 {REC_DIR}/")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
