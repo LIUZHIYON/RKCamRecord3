@@ -6,10 +6,10 @@ import cv2, numpy as np
 from flask import Flask, Response, jsonify
 
 CAMERA_INDEX = 11
-FRAME_W = 1920
-FRAME_H = 1080
-FPS_LIMIT = 24
-JPEG_Q = 75
+FRAME_W = 1280
+FRAME_H = 720
+FPS_LIMIT = 15
+JPEG_Q = 60
 PORT = 5000
 
 app = Flask(__name__)

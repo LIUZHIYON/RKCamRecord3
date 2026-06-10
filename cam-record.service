@@ -1,0 +1,17 @@
+[Unit]
+Description=RKCamRecord3 — Camera Stream + HW Recording
+After=network.target rkaiq_3A.service
+Wants=rkaiq_3A.service
+
+[Service]
+Type=simple
+User=cat
+WorkingDirectory=/home/cat
+ExecStartPre=/usr/bin/v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl vertical_blanking=200
+ExecStartPre=/usr/bin/v4l2-ctl -d /dev/video11 --set-fmt-video=width=1920,height=1080,pixelformat=NV12
+ExecStart=/usr/bin/python3 /home/cat/board_cam_record.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

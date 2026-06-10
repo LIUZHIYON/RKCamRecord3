@@ -1,138 +1,92 @@
-# 🎥 RKCamRecord3 — 摄像头远程录制控制
+# RKCamRecord3 — RK3576 相机推流 + 硬件编码录像
 
-> 在电脑上通过浏览器远程控制 **RK3576 板子** 上的 MIPI 摄像头（Sony IMX415），  
-> 实现**实时预览、录制、暂停恢复、文件管理**一站式操作。
+基于 Rockchip RK3576S + IMX415 的相机服务，支持 MJPEG 推流和 **MPP 硬件 H.264 编码**录像。
 
----
+## 硬件
 
-## 📋 项目结构
-
-```
-RKCamRecord3/
-├── pc_server.py                # PC 端 Web 服务器（运行这个）
-├── board_cam_server.py         # 板端摄像头服务器
-├── watchdog.py                 # 板端守望脚本（自动保活）
-├── redeploy.py                 # 一键部署+启动（PC→板子）
-├── run_pc.bat                  # 双击启动 PC 端
-├── templates/
-│   └── index.html              # Web 界面
-├── static/
-│   └── style.css               # 界面样式
-├── recordings/                 # 录制的视频文件
-├── requirements.txt            # Python 依赖
-└── README.md                   # 本文件
-```
-
----
-
-## 🚀 快速开始
-
-### 1. 板子端 — 部署并启动摄像头服务
-
-```bash
-# 一键部署（上传 + 启动 + 守望）
-python redeploy.py
-```
-
-或手动操作：
-
-```bash
-# SSH 连接板子
-ssh cat@192.168.55.32
-
-# 上传脚本（在电脑上执行）
-scp board_cam_server.py cat@192.168.55.32:~/
-scp watchdog.py cat@192.168.55.32:~/
-
-# 在板子上启动
-ssh cat@192.168.55.32 "setsid python3 ~/board_cam_server.py > ~/cam_server.log 2>&1 &"
-ssh cat@192.168.55.32 "setsid python3 ~/watchdog.py > ~/watchdog.log 2>&1 &"
-```
-
-验证：`curl http://192.168.55.32:5000/status` 返回摄像头在线即可。
-
-### 2. 电脑端 — 打开控制面板
-
-```bash
-# 双击 run_pc.bat，或：
-python pc_server.py
-```
-
-浏览器打开 **http://localhost:5001**
-
----
-
-## 🎮 功能介绍
-
-| 功能 | 操作 |
+| 组件 | 型号 |
 |------|------|
-| 📹 **实时预览** | 打开页面自动显示摄像头画面 |
-| 🔴 **开始录制** | 点击「● 开始录制」，帧保存在电脑本地 |
-| ⏸ **暂停/恢复** | 录制中可随时暂停和恢复 |
-| ■ **停止录制** | 自动保存为 MP4，记录时长/帧数/分辨率 |
-| ✏️ **重命名文件** | 在文件列表点击 ✏️ 修改文件名 |
-| ⬇️ **下载文件** | 点击 ⬇️ 下载到电脑 |
-| 🗑️ **删除文件** | 点击 🗑️ 删除不需要的录制文件 |
-| 🛡️ **看门狗** | 板端守望脚本自动重启崩溃的服务 |
+| 主控 | Rockchip RK3576S (Cortex-A72×4 + A53×4) |
+| 相机 | Sony IMX415 (MIPI CSI, 4K) → /dev/video11 |
+| 编码 | Rockchip MPP (mpph264enc) 硬件 H.264 |
+| 存储 | 29GB eMMC，录像目录 `/home/cat/recordings/` |
 
-> 录制在 PC 端完成，不占用板子存储空间。
-
----
-
-## ⚙️ 配置参数
-
-编辑对应文件顶部即可修改：
-
-| 参数 | 所在文件 | 默认值 |
-|------|---------|--------|
-| 板子 IP | `pc_server.py` | `192.168.55.32` |
-| 板子端口 | `board_cam_server.py` / `pc_server.py` | `5000` |
-| PC 端口 | `pc_server.py` | `5001` |
-| 摄像头设备 | `board_cam_server.py` | `/dev/video11` (rkisp_mainpath) |
-| 分辨率 | `board_cam_server.py` | `1920×1080` |
-| 帧率限制 | `board_cam_server.py` | `24 fps` |
-| JPEG 画质 | `board_cam_server.py` | `75` |
-
----
-
-## 🏗️ 硬件架构
+## 架构
 
 ```
-Sony IMX415 (MIPI CSI)
-       ↓
-rkisp (ISP) — 硬件去马赛克、AWB、缩放
-       ↓
-rkisp_mainpath (/dev/video11) — NV12 YUV 视频
-       ↓
-board_cam_server.py — MJPEG 流 (HTTP)
-       ↓
-PC Web 界面 — 预览 / 录制 / 管理
+┌─────────────┐    ┌──────────┐    ┌───────────┐
+│  OpenCV     │───▶│ GStreamer│───▶│ MP4 File  │
+│  Capture    │    │ appsrc   │    │ (HW Enc)  │
+└──────┬──────┘    └──────────┘    └───────────┘
+       │
+       ▼
+┌──────────────────┐
+│ Flask Web UI     │
+│ :5000/           │
+│ - 实时画面       │
+│ - 开始/停止录像  │
+│ - 文件下载       │
+└──────────────────┘
 ```
 
-摄像头通过 MIPI-CSI 接口连接，走 Rockchip ISP 管线，输出 NV12 格式。  
-板端服务器用 OpenCV 读取并编码为 MJPEG，PC 端通过 HTTP 拉流。
+## 快速开始
 
----
+板子通电后，打开浏览器访问：
 
-## 📦 依赖安装
+```
+http://192.168.55.32:5000/
+```
 
-### PC 端
+（IP 以实际为准）
+
+## 文件说明
+
+| 文件 | 说明 |
+|------|------|
+| `board_cam_record.py` | 主程序（Flask + GStreamer MPP 编码 + Web UI） |
+| `start_cam.sh` | 一键启动脚本 |
+| `setup_cam_v2.sh` | 相机管线配置（vblank 修复） |
+| `cam-record.service` | systemd 自启动服务 |
+
+## 安装到板子
 
 ```bash
-pip install flask opencv-python requests numpy paramiko
+# 1. 配置相机管线
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl vertical_blanking=200
+v4l2-ctl -d /dev/video11 --set-fmt-video=width=1920,height=1080,pixelformat=NV12
+
+# 2. 运行
+python3 board_cam_record.py
+
+# 3. 开机自启（推荐）
+sudo cp cam-record.service /etc/systemd/system/
+sudo systemctl enable cam-record.service
+sudo systemctl start cam-record.service
 ```
 
-### 板端 (RK3576, Debian)
+## API
 
-```bash
-pip3 install flask opencv-python numpy
-```
+| 路由 | 方法 | 说明 |
+|------|------|------|
+| `/` | GET | Web UI 控制台 |
+| `/stream` | GET | MJPEG 实时推流 |
+| `/status` | GET | JSON 状态（相机、录像状态、文件列表） |
+| `/record/start` | POST | 开始录像（硬件 H.264 编码） |
+| `/record/stop` | POST | 停止录像，返回文件信息 |
+| `/download/&lt;filename&gt;` | GET | 下载录像文件 |
 
----
+## 录像效果
 
-## 📝 注意
+| 指标 | 数值 |
+|------|------|
+| 分辨率 | 1920×1080 |
+| 帧率 | 24 FPS |
+| 编码 | H.264 High Profile (硬件 MPP) |
+| 码率 | ~6 Mbps |
+| CPU 占用 | ~10-20%（硬件编码） |
 
-- 录制文件保存在电脑端 `recordings/` 目录，板子不存文件
-- `redeploy.py` 依赖 `paramiko`，可一键部署到板子
-- 板端 `watchdog.py` 每 5 秒检测一次进程，崩溃自动重启
-- `fix_media0.py` 可在 ISP 管线断裂时重新配置（通常无需使用）
+## 排坑记录
+
+1. **ISP 启动失败** — `start pipeline failed -22`，传感器 vblank 默认 58 行太短（859µs < 1000µs），调高到 200 解决
+2. **rkaiq_3A 阻塞** — 3A 服务启动时会持有 ISP 管线，配置格式后再启动可解决
+3. **MP4 文件损坏** — 使用 `qtmux` 替代 `mp4mux`，并确保 EOS 完全传播后才关闭管线
